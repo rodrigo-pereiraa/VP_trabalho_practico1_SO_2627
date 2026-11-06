@@ -1,0 +1,234 @@
+#!/bin/bash
+
+DEFAULT_DB="/tmp/.pdb"
+SEPARADOR="----------------------------------------------------------------------"
+
+usage() {
+    cat <<EOF
+Uso: $0 [{-p <dir1> [<dir2> ...] | -v}] [-f <ficheiro>] [-e <ignore_pattern>] [-s]
+      -p : Protege e guarda informação acerca de um ou mais diretórios
+      -v : Verifica alterações em ficheiros desde que foram protegidos
+      -f : Indicação do nome do ficheiro onde a base de dados será guardada
+           (Por defeito será $DEFAULT_DB)
+      -e : Permite a exclusão de ficheiros voláteis (ex. *.tmp, *.log,
+           /tmp/*) da proteção e verificação, exclusão atual $EXCLUDE
+      -s : Emissão de alertas de alta prioridade para o sistema de logging
+           usando o logger
+EOF
+}
+
+# Devolve "user<TAB>group<TAB>size<TAB>perm<TAB>mtime<TAB>sha256" de um ficheiro (valores separados por tabs)
+get_record() {
+    local f="$1" info hash
+    info=$(stat --format=$'%U\t%G\t%s\t%a\t%Y' -- "$f" 2>/dev/null) || return 1
+    hash=$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')
+    printf '%s\t%s' "$info" "$hash"
+}
+
+# Envia um alerta para o syslog, se -s tiver sido indicado e o logger existir
+alert_log() {
+    [[ "$ALERT" == 1 ]] && command -v logger >/dev/null 2>&1 && logger -p user.alert -t vp "$1"
+}
+
+# Listagem linha a linha, dos ficheiros dos diretórios dados
+# Excluindo os que correspondem ao padrão $EXCLUDE dado como $1
+list_files() {
+    local pattern="$1"; shift
+    local d f
+    for d in "$@"; do
+        find "$d" -type f 2>/dev/null
+    done | while IFS= read -r f; do
+        if [[ -n "$pattern" && "$f" == $pattern ]]; then
+            continue
+        fi
+        printf '%s\n' "$f"
+    done
+}
+
+do_protect() {
+
+    # nenhum diretório indicado como argumento 
+    local dirs=("$@")
+    if [[ ${#dirs[@]} -eq 0 ]]; then
+        echo "Erro: nenhum diretório indicado para proteger."
+        usage
+        exit 1
+    fi
+
+    # um dos diretórios nao existe
+    local d
+    for d in "${dirs[@]}"; do
+        if [[ ! -d "$d" ]]; then
+            echo "Erro: '$d' não existe ou não é um diretório."
+            exit 1
+        fi
+    done    
+
+    # apagar a base de dados antiga
+    rm -f "$DBFILE" 2>/dev/null
+
+    #
+    if ! { printf 'DIRS:%s\n' "${dirs[*]}"; printf 'EXCLUDE:%s\n' "$EXCLUDE"; } 2>/dev/null > "$DBFILE"; then
+        echo "Erro: não foi possível escrever na base de dados em '$DBFILE'."
+        exit 1
+    fi
+
+    local count=0 f rec
+    while IFS= read -r f; do
+        rec=$(get_record "$f") || continue
+        if ! printf 'FILE\t%s\t%s\n' "$f" "$rec" 2>/dev/null >> "$DBFILE"; then
+            echo "Erro: não foi possível escrever na base de dados em '$DBFILE'."
+            exit 1
+        fi
+        ((count++))
+    done < <(list_files "$EXCLUDE" "${dirs[@]}")
+
+    if ! chmod 400 "$DBFILE" 2>/dev/null; then
+        echo "Erro: não foi possível proteger a base de dados '$DBFILE' (chmod falhou)."
+        exit 1
+    fi
+
+    printf 'Base de dados de proteção %s criada com sucesso.\n' "$DBFILE"
+    printf 'Ficheiros processados: %d | Diretórios protegidos: %s\n' "$count" "${dirs[*]}"
+}
+
+do_verify() {
+    if [[ ! -f "$DBFILE" ]]; then
+        echo "Erro: base de dados de proteção '$DBFILE' não encontrada."
+        usage
+        exit 1
+    fi
+
+    local dirs=() db_exclude="" line path
+    declare -A db_user db_group db_size db_perm db_mtime db_hash known
+    local order=()  # Permite preservar a ordem dos ficheiros na BD, o que torna o output de do_verify reprodutível/previsível
+    
+    # Leitura dos metadados da BD em $DBFILE
+    while IFS= read -r line; do
+        case "$line" in
+            DIRS:*)
+                read -ra dirs <<< "${line#DIRS:}"
+                ;;
+            EXCLUDE:*)
+                db_exclude="${line#EXCLUDE:}"
+                ;;
+            $'FILE\t'*)
+                IFS=$'\t' read -r _ path user group size perm mtime hash <<< "$line"
+                order+=("$path")
+                known[$path]=1
+                db_user[$path]=$user
+                db_group[$path]=$group
+                db_size[$path]=$size
+                db_perm[$path]=$perm
+                db_mtime[$path]=$mtime
+                db_hash[$path]=$hash
+                ;;
+        esac
+    done < "$DBFILE"
+
+    # -e tem prioridade sobre o exclude default
+    local active_exclude="${EXCLUDE:-$db_exclude}"
+
+    local verified=0 modified=0 deleted=0 new=0
+    local path2 user2 group2 size2 perm2 mtime2 hash2 rec changes sep
+
+    for path in "${order[@]}"; do
+        # Deteção de ficheiros apagados
+        if [[ ! -e "$path" ]]; then
+            echo "$path foi APAGADO"
+            printf ' Informação original: USER=%s, GROUP=%s, SIZE=%s, PERM=%s, SHA256=%s\n' \
+                "${db_user[$path]}" "${db_group[$path]}" "${db_size[$path]}" "${db_perm[$path]}" "${db_hash[$path]}"
+            printf ' Informação atual: [Ficheiro não encontrado no sistema]\n'
+            echo "$SEPARADOR"
+            ((deleted++))
+            alert_log "$path foi APAGADO"
+            continue
+        fi
+        # Deteção de ficheiros modificados
+        rec=$(get_record "$path")
+        IFS=$'\t' read -r user2 group2 size2 perm2 mtime2 hash2 <<< "$rec"
+
+        changes=()
+        [[ "$user2" != "${db_user[$path]}" || "$group2" != "${db_group[$path]}" ]] && changes+=("Posse")
+        [[ "$size2" != "${db_size[$path]}" ]] && changes+=("Tamanho")
+        [[ "$hash2" != "${db_hash[$path]}" ]] && changes+=("Conteúdo")
+        [[ "$perm2" != "${db_perm[$path]}" ]] && changes+=("Permissões")
+        [[ "$mtime2" != "${db_mtime[$path]}" ]] && changes+=("Data de Modificação")
+
+        if [[ ${#changes[@]} -gt 0 ]]; then
+            sep="${changes[0]}"
+            for ((i = 1; i < ${#changes[@]}; i++)); do
+                sep="$sep , ${changes[$i]}"
+            done
+            echo "$path foi MODIFICADO (Alteração de $sep)"
+            printf ' Informação inicial: USER=%s, GROUP=%s, SIZE=%s, PERM=%s, SHA256=%s\n' \
+                "${db_user[$path]}" "${db_group[$path]}" "${db_size[$path]}" "${db_perm[$path]}" "${db_hash[$path]}"
+            printf ' Informação atual: USER=%s, GROUP=%s, SIZE=%s, PERM=%s, SHA256=%s\n' \
+                "$user2" "$group2" "$size2" "$perm2" "$hash2"
+            echo "$SEPARADOR"
+            ((modified++))
+            alert_log "$path foi MODIFICADO ($sep)"
+        else
+            ((verified++))
+        fi
+    done
+
+    # Deteção de ficheiros novos.
+    local f
+    while IFS= read -r f; do
+        if [[ -z "${known[$f]}" ]]; then
+            rec=$(get_record "$f")
+            IFS=$'\t' read -r user2 group2 size2 perm2 mtime2 hash2 <<< "$rec"
+            echo "$f é NOVO"
+            printf ' Informação atual: USER=%s, GROUP=%s, SIZE=%s, PERM=%s, SHA256=%s\n' \
+                "$user2" "$group2" "$size2" "$perm2" "$hash2"
+            echo "$SEPARADOR"
+            ((new++))
+            alert_log "$f é NOVO"
+        fi
+    done < <(list_files "$active_exclude" "${dirs[@]}")
+
+    printf 'Resumo da Verificação: %d verificados | %d Modificado(s) | %d Apagado(s) | %d Novo(s)\n' \
+        "$verified" "$modified" "$deleted" "$new"
+}
+
+# Análise das flags e argumentos na linha de comandos 
+
+P_FLAG=0
+V_FLAG=0
+DBFILE="$DEFAULT_DB"
+EXCLUDE=""
+ALERT=0
+DIRS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p) P_FLAG=1; shift ;;
+        -v) V_FLAG=1; shift ;;
+        -f)
+            if [[ -z "$2" ]]; then echo "Erro: -f requer um nome de ficheiro."; usage; exit 1; fi
+            DBFILE="$2"; shift 2 ;;
+        -e)
+            if [[ -z "$2" ]]; then echo "Erro: -e requer um padrão."; usage; exit 1; fi
+            EXCLUDE="$2"; shift 2 ;;
+        -s) ALERT=1; shift ;;
+        -*)
+            echo "Switch inválido $1"
+            usage
+            exit 1 ;;
+        *)
+            DIRS+=("$1"); shift ;;
+    esac
+done
+
+if [[ "$P_FLAG" == 1 && "$V_FLAG" == 1 ]]; then
+    echo "Erro: as opções -p e -v não podem ser usadas em simultâneo."
+    usage
+    exit 1
+fi
+
+if [[ "$P_FLAG" == 1 ]]; then
+    do_protect "${DIRS[@]}"
+else
+    do_verify
+fi
