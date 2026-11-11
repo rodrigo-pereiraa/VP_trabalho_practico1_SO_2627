@@ -1,0 +1,8 @@
+livros:
+links:
+-https://stackoverflow.com/questions/10969953/how-to-output-a-multiline-string-in-bash (usado na função usage())
+-https://edoras.sdsu.edu/doc/bash/abs/x16233.html (usado na função do_verify())
+-https://linuxhandbook.com/bash-associative-arrays/ - arrays associativos(usado na função do_verify())
+-https://man7.org/linux/man-pages/man1/stat.1.html - utilização do stat (usado no get_record())
+-https://www.gnu.org/software/bash/manual/bash.html#Redirections - usado nos loops (while read)
+-https://www.gnu.org/software/bash/manual/bash.html#Pattern-Matching - padrões glob (usado na função list_files() / flag -e)

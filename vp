@@ -31,7 +31,7 @@ alert_log() {
 }
 
 # Listagem linha a linha, dos ficheiros dos diretórios dados
-# Excluindo os que correspondem ao padrão $EXCLUDE dado como $1
+# Excluindo os que correspondem ao padrão $EXCLUDE dado como $1 da função
 list_files() {
     local pattern="$1"; shift
     local d f
@@ -55,7 +55,7 @@ do_protect() {
         exit 1
     fi
 
-    # um dos diretórios nao existe
+    # pelos menos um dos diretórios não existe
     local d
     for d in "${dirs[@]}"; do
         if [[ ! -d "$d" ]]; then
@@ -67,12 +67,13 @@ do_protect() {
     # apagar a base de dados antiga
     rm -f "$DBFILE" 2>/dev/null
 
-    #
+    # criar a base de dados e escrever o header na BD
     if ! { printf 'DIRS:%s\n' "${dirs[*]}"; printf 'EXCLUDE:%s\n' "$EXCLUDE"; } 2>/dev/null > "$DBFILE"; then
         echo "Erro: não foi possível escrever na base de dados em '$DBFILE'."
         exit 1
     fi
 
+    # escrever os metadados dos ficheiros na base de dados(depois do header)
     local count=0 f rec
     while IFS= read -r f; do
         rec=$(get_record "$f") || continue
@@ -83,6 +84,7 @@ do_protect() {
         ((count++))
     done < <(list_files "$EXCLUDE" "${dirs[@]}")
 
+    # dar apenas permissões de leitura à BD
     if ! chmod 400 "$DBFILE" 2>/dev/null; then
         echo "Erro: não foi possível proteger a base de dados '$DBFILE' (chmod falhou)."
         exit 1
@@ -125,7 +127,8 @@ do_verify() {
                 ;;
         esac
     done < "$DBFILE"
-
+    
+    # usar exclude dado pela flag -e
     # -e tem prioridade sobre o exclude default
     local active_exclude="${EXCLUDE:-$db_exclude}"
 

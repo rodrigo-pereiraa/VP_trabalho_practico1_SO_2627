@@ -1,0 +1,117 @@
+Relatório: Script vigia pirata - vp
+
+Membros do Grupo:
+Rodrigo Pereira - 125696
+Crijecia Santos - 115674
+
+1. Solução conceptual
+
+A ideia principal é comparar o estado atual dos ficheiros de diretórios
+protegidos com o estado que esses mesmos ficheiros tinham no momento em
+que foram "protegidos". Para isso, o sistema começa por guardar, para
+cada ficheiro, um conjunto de dados que o caracteriza: o dono, o grupo,
+o tamanho, as permissões, a data de modificação e um hash do conteúdo.
+Esses dados servem depois de referência para detetar discrepâncias entre
+o estado antigo (registado) e o estado atual dos ficheiros.
+
+Da comparação entre os dois estados resultam quatro categorias possíveis
+para cada ficheiro:
+  - Verificado — sem alterações detetadas;
+  - Modificado — um ou mais parâmetros são diferentes do registado;
+  - Apagado — o ficheiro estava na base de dados mas já não existe;
+  - Novo — o ficheiro existe agora mas não estava registado.
+
+Para além destas funções principais, o programa oferece ainda:
+  - a possibilidade de excluir ficheiros voláteis (que não interessa
+    monitorizar, como *.tmp, *.log ou conteúdos de /tmp) da proteção e
+    da verificação;
+  - o envio de notificações para o sistema de logging (syslog), sempre
+    que uma alteração é detetada durante a verificação, caso a flag -s
+    seja usada.
+
+É também necessário proteger a própria base de dados contra alterações,
+já que, de outra forma, um atacante poderia apagar o ficheiro original
+e/ou modificá-lo de forma a não deixar rasto das alterações feitas.
+
+
+2. Implementação
+
+A solução final foi desenvolvida como um script em bash, estruturado em
+torno de duas funções principais: do_protect(), responsável pela
+proteção dos diretórios, e do_verify(), responsável pela verificação de
+alterações.
+
+A informação de cada ficheiro é obtida através de stat (metadados) e
+sha256sum (hash do conteúdo), recolhidos pela função get_record(), que é
+reutilizada tanto por do_protect() como por do_verify().
+
+A base de dados é um ficheiro de texto simples, em que os dados de cada
+ficheiro ocupam uma linha, com os campos separados por TAB. Esta escolha
+(TAB em vez de ";") deve-se ao facto de ser possível os nomes de ficheiros e diretórios
+conterem o caractere ";", o que corromperia o
+parsing da base de dados, por exemplo criando um ficheiro chamado ";", ou seja com o comando  mkdir ";".
+
+Depois de criada, a base de dados fica apenas com a permissão de leitura
+(chmod 400), para que não possa ser modificada posteriormente.
+
+Na verificação, a informação da base de dados é carregada para arrays
+associativos, um por
+cada tipo de dado (dono, grupo, tamanho, permissões, data de
+modificação e hash), usando o caminho do ficheiro como chave.
+Isto permite aceder diretamente aos valores registados de qualquer
+ficheiro a partir do seu caminho, e compará-los com o estado atual do
+ficheiro no sistema. No final da verificação é apresentado um resumo
+com o número de ficheiros em cada categoria (verificados, modificados,
+apagados, novos).
+
+As opções de linha de comandos "-f" (nome da base de dados), "-e"
+(exclusão de ficheiros) e "-s" (ativação de alertas) foram implementadas
+como parâmetros opcionais. Já as opções "-p" e "-v" são mutuamente
+exclusivas, sendo "-v" a opção usada por defeito quando nenhuma das duas
+é indicada.
+
+
+3. Aspectos adicionais
+
+  - A Substituição de processos é utilizada em vez de pipes nos loops
+    que envolvem contadores, uma vez que a substituição de processos
+    não cria uma subshell (como o pipe faz), o que permite que o
+    contador funcione corretamente, sem perder a conta das iterações, usados nos
+    loops "while read" da função do_verify()).
+  - Arrays associativos: usados para representar, de forma eficiente,
+    os dados de cada ficheiro indexados pelo seu caminho.
+  - Ordem reprodutível do output: a verificação guarda, num array
+    auxiliar (order), a ordem dos ficheiros tal como aparecem na base
+    de dados. Isto torna o output de do_verify() determinístico e
+    reprodutível entre execuções, já que a ordem de iteração de um
+    array associativo em bash não é garantida.
+  - Resiliência do alerta de syslog: a função alert_log() só invoca o
+    comando logger se este estiver efetivamente disponível no sistema
+    (verificado com command -v logger), evitando que o script falhe
+    em sistemas onde o utilitário não esteja instalado, mesmo com a
+    flag -s ativa.
+
+
+4. Princípios seguidos ao escrever o código
+
+  - Silenciar erros não relevantes com 2>/dev/null;
+  - Chamar a função usage() imediatamente após uma mensagem de erro de utilização incorreta do
+    programa;
+  - Terminar a execução com exit 1 após qualquer mensagem de erro
+    manual.
+
+
+5. Limitações
+
+  - Proteção da base de dados não é absoluta: o chmod 400 impede a
+    escrita direta no ficheiro da base de dados, mas não impede que o root ou 
+    um utilizador ,com permissões suficientes sobre o diretório onde
+    a BD se encontra, a apague e a substitua por completo, tornando a proteção obsuleta.
+  - A flag -e aceita apena um único argumento (um único padrão glob), não sendo possível
+    indicar vários padrões distintos (ex. *.tmp e *.log) na mesma
+    invocação.
+
+6. Uso de IA
+
+Foi utilizada IA no debugging e ajuda na ideação de casos para testar o script,
+também foi usada para aprender conceitos mais complexos usados neste trabalho.
